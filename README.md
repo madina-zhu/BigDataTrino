@@ -12,7 +12,7 @@
 2. **DWH / Модель «Звезда» (`clickhouse.star_schema`):**
    - Таблица фактов: `fact_sales` (10 000 записей о продажах).
    - Таблицы измерений: `dim_customers`, `dim_sellers`, `dim_products`, `dim_stores`, `dim_suppliers`, `dim_dates`.
-   - Детерминированные суррогатные ключи (`*_sk`) генерируются в Trino через `xxhash64`.
+   - Детерминированные суррогатные ключи (`*_sk`) генерируются в Trino через `xxhash64` от всех атрибутов измерения, поэтому ключ уникален для каждой строки измерения и JOIN фактов не размножает строки.
 3. **Витрины отчетов (`clickhouse.reports`):**
    - `report_products` — витрина продаж по продуктам (топ продаж, выручка по категориям, средний рейтинг и отзывы).
    - `report_customers` — витрина продаж по клиентам (топ покупателей, распределение по странам, средний чек).
@@ -37,7 +37,11 @@
 ├── trino_scripts/
 │   ├── 01_etl_star_schema.sql          # ETL-скрипт: Источники (PG + CH) -> Модель Звезда (CH)
 │   └── 02_create_reports.sql           # ETL-скрипт: Модель Звезда -> 6 витрин отчетов (CH)
-├── docker-compose.yml                  # Оркестрация контейнеров PostgreSQL, ClickHouse и Trino
+├── scripts/
+│   ├── run_etl.sh                      # Полный прогон: запуск, ожидание, очистка, ETL, проверка
+│   ├── reset_dwh.sql                   # Очистка звезды и витрин (идемпотентность)
+│   └── check.sql                       # Контрольные проверки результата
+├── docker-compose.yml                  # Оркестрация контейнеров PostgreSQL, ClickHouse и Trino (с healthcheck)
 └── README.md                           # Документация и инструкция по запуску
 ```
 
@@ -45,12 +49,20 @@
 
 ## Инструкция по запуску и проверке
 
+### Быстрый запуск (одной командой)
+```bash
+./scripts/run_etl.sh
+```
+Скрипт поднимает контейнеры, ждёт их готовности (healthcheck'и), очищает звезду и витрины (повторный запуск не удваивает данные), выполняет оба Trino-скрипта и печатает таблицу контрольных проверок (`scripts/check.sql`, все строки должны иметь `ok = 1`).
+
+Ниже те же шаги вручную.
+
 ### 1. Запуск инфраструктуры
 Из корневой директории проекта запустите контейнеры в фоновом режиме:
 ```bash
 docker compose up -d
 ```
-Дождитесь полной инициализации сервисов (около 15–20 секунд). При старте PostgreSQL и ClickHouse автоматически создадут таблицы и импортируют по 5 000 строк из папки `data/`.
+Дождитесь, пока все три контейнера станут `healthy` (`docker compose ps`, обычно 30–60 секунд). При старте PostgreSQL и ClickHouse автоматически создадут таблицы и импортируют по 5 000 строк из папки `data/`; Trino стартует только после этого.
 
 ### 2. Проверка загрузки исходных данных
 Убедитесь, что в каждой базе находится по 5 000 записей:
@@ -62,10 +74,13 @@ docker exec -it lab_postgres psql -U user -d lab_db -c "SELECT COUNT(*) FROM moc
 docker exec -it lab_clickhouse clickhouse-client --query "SELECT COUNT(*) FROM default.mock_data;"
 ```
 
+> Если ETL запускается повторно вручную, сначала очистите целевые таблицы:
+> `docker exec -i lab_clickhouse clickhouse-client --multiquery < scripts/reset_dwh.sql`
+
 ### 3. Запуск ETL-трансформации в модель «Звезда»
 Выполните первый SQL-скрипт через Trino для объединения данных из обеих СУБД и заполнения таблиц измерений и фактов в ClickHouse:
 ```bash
-docker exec -i lab_trino trino --catalog clickhouse --schema star_schema < trino_scripts/01_etl_star_schema.sql
+docker exec lab_trino trino --file /scripts/01_etl_star_schema.sql
 ```
 Проверка заполнения таблицы фактов (ожидается `10000`):
 ```bash
@@ -75,7 +90,7 @@ docker exec -it lab_clickhouse clickhouse-client --query "SELECT COUNT(*) FROM s
 ### 4. Формирование аналитических витрин (отчетов)
 Выполните второй SQL-скрипт через Trino для расчета метрик и заполнения 6 таблиц отчетов в базе `reports`:
 ```bash
-docker exec -i lab_trino trino --catalog clickhouse --schema reports < trino_scripts/02_create_reports.sql
+docker exec lab_trino trino --file /scripts/02_create_reports.sql
 ```
 
 ---
@@ -107,6 +122,10 @@ SELECT * FROM reports.report_suppliers WHERE revenue_rank <= 5 ORDER BY revenue_
 -- 6. Анализ качества продукции (рейтинги, отзывы и корреляция с продажами)
 SELECT * FROM reports.report_product_quality WHERE highest_rating_rank <= 10 ORDER BY highest_rating_rank;
 ```
+
+Автоматическая проверка всего результата: `docker exec -i lab_clickhouse clickhouse-client --multiquery --format PrettyCompactMonoBlock < scripts/check.sql`.
+
+> Примечание по данным: в `MOCK_DATA` каждая строка описывает уникального клиента, продавца, магазин, поставщика и товар (в каждом файле `id` и `sale_*_id` повторяются 1..1000, поэтому как ключи не годятся). Измерения строятся по уникальным наборам атрибутов, ранги «топ-N» разрешают ничьи детерминированно (`ROW_NUMBER`).
 
 ### Остановка и очистка окружения
 Для полной остановки контейнеров и удаления созданных томов выполните:
